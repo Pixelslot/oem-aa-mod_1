@@ -1,9 +1,3 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
-//
-// Adapted from headunit (https://github.com/Trevelopment/headunit),
-// licensed under GNU AGPL v3.
-// See NOTICE.md at the repo root for the full attribution.
-
 #define LOG_TAG "HUD"
 #include "../log.h"
 #include "hud.h"
@@ -11,18 +5,7 @@
                              // (HudNav16Sink, AaGuidance/Position/Status, AaLane, mappers)
 #include "common/config.h"   // libpatch_config::hud_transport()
 
-// HUD transport selection. Two transports send our guidance to the
-// HUD by different routes:
-//   * vbs     (vbs_tx.{h,cpp})       — writes the HUD frame directly to
-//                                      com.jci.vbs.navi (libjcimod_navigation
-//                                      inside the jciVBS process). Works with
-//                                      no navigation SD card.
-//   * svcnavi (svcnavi_tx.{h,cpp})   — emits GuidanceChangedForHUD to
-//                                      svcjcinavi, which forwards as the single
-//                                      HUD-frame writer. Needs the nav SD card.
-// Both backends are compiled in; the active one is chosen at RUNTIME
-// from libpatch.conf (hud_transport=svcnavi|vbs), defaulting to svcnavi.
-// See config.{h,cpp}.
+
 #include "svcnavi_tx.h"
 #include "vbs_tx.h"
 #include "translit.h"   // hud_translit::fold() — precomposed-Latin street-name fold
@@ -34,10 +17,7 @@
 
 namespace {
 
-// Transport forwarders — bind once to the configured backend, then stay
-// transport-agnostic at the call sites. Both backends expose the same
-// five free functions with identical signatures, so an ops table of
-// plain function pointers selects between them with no per-call branch.
+
 struct HudTransportOps {
     void (*start)();
     void (*stop)();
@@ -47,10 +27,7 @@ struct HudTransportOps {
     void (*lanes)(const uint8_t *codes);             // raw setter; fed by emit_lane_codes
 };
 
-// Per-transport next_turn adapters. Today both just forward the resolved glyph +
-// road, but a distinct wrapper per backend gives hud.cpp a seam to encode
-// next_turn differently per transport later (e.g. a road-name transform one
-// backend needs and the other doesn't) without touching the ops-table wiring.
+
 void svcnavi_next_turn_adapter(const char *road, uint32_t icon)
 {
     svcnavi_tx_next_turn(road, icon);
@@ -60,18 +37,18 @@ void vbs_next_turn_adapter(const char *road, uint32_t icon)
     vbs_tx_next_turn(road, icon);
 }
 
-// Encode the decoded 1.6 lanes to 8 OEM lane CODES (0..70), LEFT to RIGHT; an
-// absent slot is HIDDEN (canonical 0 == OEM_LANE_NONE).
-// hud_lane.h owns the full AA-shape -> OEM-code mapping: single arrows, the
-// multi-direction combos, and the recommended-direction detail codes that pick
-// out the highlighted arrow within a combo.
+//   1  = recommended lane marker (small triangle)
+//   28 = non-recommended lane (blank triangle, no marker)
+//   0  = no lane in this slot
 void nav16_encode_lane_codes(const AaLane *lanes, int n, uint8_t out[HUD_NAV16_MAX_LANES])
 {
     for (int i = 0; i < HUD_NAV16_MAX_LANES; ++i) {
-        out[i] = (lanes && i < n)
-                     ? (uint8_t)oem_lane_code_for_aa(lanes[i].present_mask,
-                                                     lanes[i].highlight_mask)
-                     : (uint8_t)OEM_LANE_NONE;   // 0 = hidden
+        if (lanes && i < n) {
+            bool is_recommended = (lanes[i].highlight_mask != 0);
+            out[i] = is_recommended ? 1 : 28;
+        } else {
+            out[i] = 0;
+        }
     }
 }
 
@@ -84,10 +61,7 @@ const HudTransportOps kVbsOps = {
     &vbs_next_turn_adapter, &vbs_tx_distance, &vbs_tx_lanes,
 };
 
-// The active backend. Bound once in hud_tx_start() (the first transport
-// call of every session) from the config value, then used directly by
-// the per-event forwarders that only ever fire after start. Defaults to
-// svcnavi so a stray call before binding still has a valid target.
+
 const HudTransportOps *g_tx = &kSvcnaviOps;
 
 inline void hud_tx_start()
@@ -97,27 +71,15 @@ inline void hud_tx_start()
     g_tx->start();
 }
 inline void hud_tx_stop()   { g_tx->stop(); }
-// NOTE: the single-writer invariant is enforced at the producer ENTRY points,
-// not on these shared forwarders — our_nav_cb (1.5) returns early once 1.6
-// frames are actually arriving (hud_nav16_rx_seen), and the 1.6 path's only
-// writer is the rx thread (which only runs under v1.6).
-// hud_tx_status is intentionally NOT guarded: the 1.6 CLEAR path calls it.
+
 inline void hud_tx_status(uint32_t status) { g_tx->status(status); }
 inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
                              int32_t angle, int32_t /*number*/)
 {
-    // hud.cpp owns the AA turn_event/side/angle -> Mazda glyph mapping now; the
-    // transports just relay the resolved icon + street name (see hud_nav.h).
-    // turn_number is unused (the HUD frame has no maneuver-number field).
+    
     uint32_t icon = compute_turn_icon(event, side, angle);
 
-    // Fold HUD-unrenderable precomposed Latin letters (Latin Extended
-    // Additional, U+1E00..U+1EFF) down to their base forms so accented
-    // street names show legibly instead of gapping (gated by
-    // hud_fold_latin, default off). Copy the SDK-owned (const) road name
-    // into a local buffer first, then fold in place — the fold only ever
-    // shrinks, so 256 bounds it (the transports truncate to their own
-    // buffer anyway).
+    
     if (road != nullptr && libpatch_config::hud_fold_latin()) {
         char buf[256];
         strncpy(buf, road, sizeof(buf) - 1);
@@ -130,59 +92,32 @@ inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
 }
 inline void hud_tx_distance(int32_t disp_dist, uint32_t disp_unit)
 {
-    // The transports take Mazda-domain distance (value*10) + Mazda unit, so do
-    // the AA-proto conversion here: display_distance is raw_unit*1000 (the HUD
-    // wire wants raw_unit*10) and disp_unit is proto DISPLAY_DISTANCE_UNIT.
+    
     g_tx->distance(disp_dist / 100, map_distance_unit(disp_unit));
 }
 
-// cb_list shape: 19 word slots, total 76 bytes. The SDK memcpy's
-// all 76 bytes into the session handle at handle+0x20 inside
-// aap_create_session.
+
 constexpr int kCbListWordSlots = 19;       // 0x4c bytes
 constexpr int kCbListNavSlot   = 10;       // byte offset 0x28 — E_AAP_EVENT_NAV_DATA_CB
 constexpr int kCbListUserSlot  = 18;       // byte offset 0x48 — passed as first arg
 
-// Tag values that prefix every 36-byte event header. Pinned by the
-// producer in aap_service.c (navigationStatusCallback emits 0x500
-// from a NAVMessagesStatus proto; navigationNextTurnCallback emits
-// 0x501 from a NAVTurnMessage; navigationNextTurnDistanceCallback
+
 // emits 0x502 from a NAVDistanceMessage).
 constexpr uint32_t kTagStatus    = 0x500;   // NAVMessagesStatus
 constexpr uint32_t kTagNextTurn  = 0x501;   // NAVTurnMessage
 constexpr uint32_t kTagDistance  = 0x502;   // NAVDistanceMessage
 
-// NAVMessagesStatus.STATUS — proto enum, hu.proto:
-//   START = 1; STOP = 2;
-// Any other value seen on the wire is an unspecified / unknown
-// state; the producer in aap_service is the only thing in front of
-// us that could synthesise one, and it forwards verbatim.
 enum NavStatusEnum : uint32_t {
     NAV_STATUS_START = 1,
     NAV_STATUS_STOP  = 2,
 };
 
-// NAVTurnMessage.TURN_SIDE — proto enum, hu.proto:
-//   TURN_LEFT = 1; TURN_RIGHT = 2; TURN_UNSPECIFIED = 3;
 enum NavTurnSideEnum : uint32_t {
     NAV_TURN_LEFT        = 1,
     NAV_TURN_RIGHT       = 2,
     NAV_TURN_UNSPECIFIED = 3,
 };
 
-// NAVTurnMessage.TURN_EVENT — proto enum, hu.proto (sparse — 15
-// and 18 are intentionally unassigned in the .proto, so 0x11=17
-// and 0x13=19 are the only valid values in that gap):
-//   0  TURN_UNKNOWN              10 TURN_MERGE
-//   1  TURN_DEPART               11 TURN_ROUNDABOUT_ENTER
-//   2  TURN_NAME_CHANGE          12 TURN_ROUNDABOUT_EXIT
-//   3  TURN_SLIGHT_TURN          13 TURN_ROUNDABOUT_ENTER_AND_EXIT
-//   4  TURN_TURN                 14 TURN_STRAIGHT
-//   5  TURN_SHARP_TURN           16 TURN_FERRY_BOAT
-//   6  TURN_U_TURN               17 TURN_FERRY_TRAIN
-//   7  TURN_ON_RAMP              19 TURN_DESTINATION
-//   8  TURN_OFF_RAMP
-//   9  TURN_FORK
 enum NavTurnEventEnum : uint32_t {
     NAV_TURN_EVENT_UNKNOWN                  =  0,
     NAV_TURN_EVENT_DEPART                   =  1,
@@ -204,44 +139,17 @@ enum NavTurnEventEnum : uint32_t {
     NAV_TURN_EVENT_DESTINATION              = 19,
 };
 
-// The value at +0x10 is NOT the raw proto turn_event — the producer
-// re-bases it first. Before forwarding, the producer compacts the
-// sparse proto enum (which skips 15 and 18) into a dense 0..17 enum,
-// i.e. it deletes the two gaps. Its mapping is, equivalently:
-//
-//     proto 0..14            -> unchanged   (0..14)
-//     proto 16 FERRY_BOAT    -> 15
-//     proto 17 FERRY_TRAIN   -> 16
-//     proto 19 DESTINATION   -> 17
-//     anything else          -> garbage (producer logs a warning and
-//                               forwards an uninitialised local)
-//
-// So the byte we receive for the destination maneuver is 17, which —
-// if read as a proto value — collides with FERRY_TRAIN and resolves
-// to a blank glyph. Undo the compaction here so the rest of the HUD
-// path (NavTurnEventEnum, nav_turn_event_name, kTurnIcons) can keep
-// indexing by the genuine proto values it was built and validated
-// against. Only the top three events move; 0..14 are identity.
+
 uint32_t decode_turn_event(uint32_t compacted)
 {
     switch (compacted) {
     case 15: return NAV_TURN_EVENT_FERRY_BOAT;   // 15 -> 16
     case 16: return NAV_TURN_EVENT_FERRY_TRAIN;  // 16 -> 17
     case 17: return NAV_TURN_EVENT_DESTINATION;  // 17 -> 19
-    default: return compacted;                   // 0..14 pass through;
-                                                 // 18/19/… never appear
-                                                 // (producer can't emit
-                                                 // them) but stay benign.
+    default: return compacted;
     }
 }
 
-// NAVDistanceMessage.DISPLAY_DISTANCE_UNIT — proto enum, hu.proto:
-//   METERS       = 1  // meters    * 1000 (display < 1000 m)
-//   KILOMETERS10 = 2  // km        * 1000 (display > 10 km)
-//   KILOMETERS   = 3  // km        * 1000 (display 1..10 km)
-//   MILES10      = 4  // miles     * 1000 (display > 10 mi)
-//   MILES        = 5  // miles     * 1000 (display 1..10 mi)
-//   FEET         = 6  // feet      * 1000
 enum NavDistanceUnitEnum : uint32_t {
     NAV_DISTUNIT_METERS       = 1,
     NAV_DISTUNIT_KILOMETERS10 = 2,
@@ -251,34 +159,12 @@ enum NavDistanceUnitEnum : uint32_t {
     NAV_DISTUNIT_FEET         = 6,
 };
 
-// 0x501 header field offsets — sized for IMAGE_CODES_ONLY cluster
-// mode but the layout itself is identical in CUSTOM_IMAGES_SUPPORTED
-// mode (icon pointer/length are just NULL/0 when the receiver-lib
-// advertises IMAGE_CODES_ONLY). All offsets are byte offsets into
-// the 36-byte buffer the SDK hands us.
-//
-// Layout (verified against §5.2 of the impl doc and the dispatcher
-// prep at libaap_interface.so:0x14f48):
-//   +0x00  uint32   tag                  (= 0x501)
-//   +0x04  char *   road_name            (heap, freed by SDK on return;
-//                                         proto calls this `event_name`)
-//   +0x08  uint32   road_name_len
-//   +0x0C  uint32   turn_side            (NAVTurnMessage.TURN_SIDE)
-//   +0x10  uint32   turn_event           (producer-COMPACTED TURN_EVENT,
-//                                         dense 0..17 — NOT the raw proto
-//                                         value; decode_turn_event() maps it
-//                                         back to the sparse proto enum)
-//   +0x14  void *   image                (PNG bytes when IMAGE mode;
-//                                         NULL in IMAGE_CODES_ONLY mode)
-//   +0x18  uint32   image_len            (0 in IMAGE_CODES_ONLY mode)
-//   +0x1C  int32    turn_angle           (degrees, signed)
-//   +0x20  int32    turn_number          (maneuver/exit number)
 struct NextTurnHdr {
     uint32_t    tag;
     const char *road_name;
     uint32_t    road_name_len;
     uint32_t    turn_side;
-    uint32_t    turn_event;   // producer-compacted; run through decode_turn_event()
+    uint32_t    turn_event;
     const void *image;
     uint32_t    image_len;
     int32_t     turn_angle;
@@ -286,33 +172,20 @@ struct NextTurnHdr {
 };
 static_assert(sizeof(NextTurnHdr) == 36, "NextTurnHdr must match 36-byte SDK buffer");
 
-// 0x500 header — only status is meaningful, the remaining 28 bytes
-// are zeroed by the dispatcher's memset(stack_buf, 0, 36) at
-// libaap_interface.so:0x14cb0. The wire proto only defines
-// START=1 / STOP=2; the producer forwards verbatim, so an
-// out-of-range value here means a malformed or version-skewed phone.
 struct StatusHdr {
-    uint32_t tag;       // = 0x500
-    uint32_t status;    // NAVMessagesStatus.STATUS — 1=START, 2=STOP
+    uint32_t tag;
+    uint32_t status;
     uint32_t reserved[7];
 };
 static_assert(sizeof(StatusHdr) == 36, "StatusHdr must match 36-byte SDK buffer");
 
 // 0x502 header — distance / ETA. Last 16 bytes reserved.
-//
-// `display_distance` is `uint64` on the proto wire but the SDK's
-// 36-byte buffer only allocates 4 bytes for it (the next field —
-// `display_distance_unit` — sits immediately after at +0x10), so
-// the producer truncates to the low 32 bits. In practice values are
-// always small (millimetre-precision distance up to ~10 mi/km, well
-// under 2^31), so the truncation is loss-free.
 struct DistanceHdr {
-    uint32_t tag;                      // = 0x502
-    int32_t  distance;                 // proto `distance` — meters to next maneuver
-    int32_t  time_until;               // proto `time_until` — seconds to next maneuver
-    int32_t  display_distance;         // proto `display_distance` low 32 bits
-                                       // (raw unit value * 1000; see enum below)
-    uint32_t display_distance_unit;    // NAVDistanceMessage.DISPLAY_DISTANCE_UNIT, 1..6
+    uint32_t tag;
+    int32_t  distance;
+    int32_t  time_until;
+    int32_t  display_distance;
+    uint32_t display_distance_unit;
     uint32_t reserved[4];
 };
 static_assert(sizeof(DistanceHdr) == 36, "DistanceHdr must match 36-byte SDK buffer");
@@ -387,15 +260,6 @@ void dump_status(const StatusHdr *h)
 
 void dump_next_turn(const NextTurnHdr *h, uint32_t turn_event)
 {
-    // road_name is a heap pointer the SDK frees the moment we
-    // return; for the log we copy at most a sane cap into a stack
-    // buffer so the format-string read is bounded even if the SDK
-    // ever forgets to NUL-terminate. road_name_len is the
-    // authoritative length (excludes the trailing NUL).
-    //
-    // (The proto field name is `event_name` but observed payloads
-    // and the SDK's internal naming both treat this as the road
-    // name string. Keeping `road_name` everywhere for clarity.)
     constexpr size_t kRoadCap = 255;
     char road[kRoadCap + 1];
     road[0] = '\0';
@@ -406,10 +270,6 @@ void dump_next_turn(const NextTurnHdr *h, uint32_t turn_event)
         road[n] = '\0';
     }
 
-    // h->turn_event is the producer's compacted value; `turn_event`
-    // (passed in) has already been mapped back to the proto enum, so
-    // the name lookup matches the proto table. Log both so the field
-    // semantics stay traceable: raw= what arrived, = proto value.
     LOGD("nav 0x501 NAVTurnMessage: road=\"%s\" road_len=%u "
          "turn_side=%u(%s) turn_event=%u(%s) raw_event=%u "
          "turn_angle=%d turn_number=%d image=%p image_len=%u",
@@ -425,10 +285,6 @@ void dump_next_turn(const NextTurnHdr *h, uint32_t turn_event)
          h->image,
          static_cast<unsigned>(h->image_len));
 
-    // Sanity check: in IMAGE_CODES_ONLY cluster mode we expect
-    // image_len==0 and image==NULL. Surface a warning if the XML
-    // wasn't flipped to ENUM (or if the phone ignores the advertised
-    // cluster_type and sends a PNG anyway).
     if (h->image_len != 0 || h->image != nullptr) {
         LOGW("nav 0x501: unexpected image payload in IMAGE_CODES_ONLY "
              "mode (image=%p image_len=%u) — check "
@@ -451,23 +307,13 @@ void dump_distance(const DistanceHdr *h)
 
 void our_nav_cb(void *user_ctx, void *hdr36)
 {
-    (void)user_ctx;  // We don't set cb_list[18], so this is NULL.
+    (void)user_ctx;
 
     if (!hdr36) {
         LOGW("nav cb: NULL header — SDK contract violation, ignoring");
         return;
     }
 
-    // Single-writer guard + 1.5 fallback: drop the legacy 0x500/0x501/0x502
-    // callbacks only once 1.6 frames are actually arriving on the rx socket —
-    // NOT on the config flag. aap_service (which advertises 1.6) and this
-    // process share only the config key, not the negotiated session, so with
-    // the flag set but the 1.6 chain broken (shim not preloaded, byte-verify
-    // aborted, phone declined) the phone keeps speaking 1.5 and these
-    // callbacks are the only guidance there is — dropping them would leave
-    // the HUD dark. A session speaks one protocol, so the two snapshot
-    // writers still never race (the seqlock is SPSC); the latch just picks
-    // the producer per session.
     if (hud_nav16_rx_seen()) return;
 
     const uint32_t tag = *static_cast<const uint32_t *>(hdr36);
@@ -519,14 +365,6 @@ void our_nav_cb(void *user_ctx, void *hdr36)
 
 } // namespace
 
-// Called from the aap_create_session PLT shim BEFORE chaining
-// through. Modifying cb_list[10] in place is safe because the SDK
-// copies the full 76-byte table into the session handle inside
-// aap_create_session; once that copy is done, the caller's stack
-// buffer is dead memory.
-//
-// We leave cb_list[18] (the user-context slot) untouched — the OEM
-// never sets it, and we have no per-session state to thread through.
 void hud_pre_aap_create_session(void *cb_list)
 {
     if (!cb_list) {
@@ -543,59 +381,35 @@ void hud_pre_aap_create_session(void *cb_list)
          cb_list, kCbListNavSlot, prev,
          reinterpret_cast<void *>(&our_nav_cb));
 
-    // Compile-time-ish guard against a future firmware that bumps
-    // the table size. If kCbListUserSlot ever drifts past the end
-    // of what we model, the touch path and the rest of the lib
-    // also need rewiring — re-harvest the cb_list layout from
-    // libaap_interface.so / blmjciaapa.so before adjusting.
     static_assert(kCbListUserSlot < kCbListWordSlots,
                   "user-context slot out of cb_list bounds");
 }
 
-// NavigationStatus (0x8003) enum (aasdk): UNAVAILABLE=0, ACTIVE=1, INACTIVE=2,
-// REROUTING=3. INACTIVE/UNAVAILABLE -> blank the HUD; ACTIVE/REROUTING -> keep.
 enum { NAV_UNAVAILABLE = 0, NAV_ACTIVE = 1, NAV_INACTIVE = 2, NAV_REROUTING = 3 };
 
-// Quantize the display distance (value*10) to its natural on-HUD granularity, so
-// a frame is only re-sent when the SHOWN figure would change — not on every
-// position tick. mi/km are already 0.1-granular; m/yd/ft step by magnitude.
 int32_t quantize_dist_x10(int32_t v, uint8_t mazda_unit)
 {
     if (v < 0) return 0;
-    if (mazda_unit == 2 || mazda_unit == 3) return v;        // mi/km: 0.1 already
-    if (v >= 5000) return (v + 250) / 500 * 500;             // far  -> 50-unit steps
-    if (v >= 1000) return (v +  50) / 100 * 100;             // mid  -> 10-unit steps
-    if (v >=  200) return (v +  25) /  50 *  50;             // near ->  5-unit steps
-    return v;                                                // final approach -> as-is
+    if (mazda_unit == 2 || mazda_unit == 3) return v;
+    if (v >= 5000) return (v + 250) / 500 * 500;
+    if (v >= 1000) return (v +  50) / 100 * 100;
+    if (v >=  200) return (v +  25) /  50 *  50;
+    return v;
 }
 
-// Accumulated Mazda-domain guidance: maneuver/road/lanes come from 0x8006,
-// distance from 0x8007, so the two streams are merged here before display. The
-// memcmp change-gate below is only a change *detector*, not a correctness
-// mechanism: it returns non-zero whenever a real field differs, so a stray
-// padding byte could at worst cause one extra, harmless HUD re-emit — never a
-// missed change. (In practice it won't even do that: both instances are
-// zero-init statics and nothing writes padding.) So exact/gap-free layout is
-// not required — no manual padding, no size assert.
 struct AaNav16HudState {
-    uint32_t glyph;                       // Mazda HUD maneuver glyph (MazdaIcon; 0=blank)
-    int32_t  dist_dec;                    // display distance * 10
-    uint8_t  dist_unit;                   // Mazda HUD unit 0..5
-    uint8_t  n_lanes;                     // 0..HUD_NAV16_MAX_LANES
-    char     road[64];                    // street name (UTF-8, folded at 0x8006 ingest)
+    uint32_t glyph;
+    int32_t  dist_dec;
+    uint8_t  dist_unit;
+    uint8_t  n_lanes;
+    char     road[64];
     AaLane   lanes[HUD_NAV16_MAX_LANES];
 };
 
-static AaNav16HudState g_nav16_acc;   // merged guidance (zero-init: gap-free memcmp)
-static AaNav16HudState g_nav16_last;  // last frame fed to the transport (change-gate)
+static AaNav16HudState g_nav16_acc;
+static AaNav16HudState g_nav16_last;
 static bool g_nav16_have_last = false;
 
-// Reset the accumulator + change-gate. Owned by the rx lifecycle: called from
-// hud_nav16_rx_start() BEFORE the receiver thread exists (the only other
-// toucher of this state), so it needs no locking. Without this, a session that
-// ends abnormally (cable pull — the phone never sends INACTIVE/STOP) leaves a
-// stale change-gate that can suppress the next session's first frame against
-// an already-blanked HUD.
 void hud_feed_nav16_reset(void)
 {
     memset(&g_nav16_acc, 0, sizeof(g_nav16_acc));
@@ -603,19 +417,10 @@ void hud_feed_nav16_reset(void)
     LOGV("nav: accumulator + change-gate reset");
 }
 
-// Change-gate emit: feed the transport only when the displayed frame changed.
-// The svcnavi transport has no consumer-side diff, so this is what prevents a
-// duplicate/continuous-tick flood on the HUD D-Bus. Shared by the guidance and
-// position callbacks (both mutate g_nav16_acc, then ask to emit).
 static void nav16_emit_if_changed()
 {
     AaNav16HudState &acc = g_nav16_acc;
     if (g_nav16_have_last && memcmp(&acc, &g_nav16_last, sizeof(acc)) == 0) return;
-    // acc holds Mazda-domain values (resolved glyph, folded road, value*10
-    // distance in the Mazda unit) plus the decoded lanes; we encode the lanes to
-    // OEM codes here (each transport maps code->glyph on its own wire as needed).
-    // The rx thread is the sole writer under v1.6, so the transport's snapshot
-    // merge is race-free.
     uint8_t lane_codes[HUD_NAV16_MAX_LANES];
     nav16_encode_lane_codes(acc.lanes, acc.n_lanes, lane_codes);
     g_tx->next_turn(acc.road, acc.glyph);
@@ -625,11 +430,6 @@ static void nav16_emit_if_changed()
     g_nav16_have_last = true;
 }
 
-// hud_nav16 sink callbacks (run on the rx thread). hud_nav16 has already decoded
-// the AA protocol; these only map the decoded structs to the Mazda HUD domain
-// (glyph, unit, fold, change-gate) and drive the shared transport.
-
-// 0x8006 NavigationState -> maneuver glyph + road + lanes.
 static void nav16_on_guidance(const AaGuidance *g)
 {
 #if LOG_LEVEL <= LOG_LEVEL_VERBOSE
@@ -638,23 +438,13 @@ static void nav16_on_guidance(const AaGuidance *g)
     AaNav16HudState &acc = g_nav16_acc;
 
     uint32_t glyph = hud_nav16_glyph(g);
-    if (glyph > 60) glyph = 0;                          // clamp untrusted glyph
+    if (glyph > 60) glyph = 0;
 
-    // Fold once here, at road ingest, not in the per-emit forwarder — distance
-    // ticks re-emit the road far more often than 0x8006 changes it. Fold a local
-    // copy (g is const, decoder-owned); strncpy into acc.road zero-pads the tail
-    // so a shorter road leaves no stale bytes for the memcmp change-gate to trip
-    // on (at worst a harmless extra emit, but free to avoid).
     char road[sizeof(acc.road)];
     strncpy(road, g->road, sizeof(road) - 1);
     road[sizeof(road) - 1] = '\0';
     if (libpatch_config::hud_fold_latin()) hud_translit::fold(road);
 
-    // A different maneuver means the held distance belongs to the PREVIOUS step
-    // (distance only ever arrives on 0x8007) — invalidate it so the new arrow is
-    // never shown against the old step's ticking-down figure. 0 + unit 0 ("none")
-    // is the same not-yet-any-distance state every session starts in; the real
-    // figure lands with the next 0x8007 (~1 s).
     if (glyph != acc.glyph || strcmp(road, acc.road) != 0) {
         acc.dist_dec  = 0;
         acc.dist_unit = 0;
@@ -673,7 +463,6 @@ static void nav16_on_guidance(const AaGuidance *g)
     nav16_emit_if_changed();
 }
 
-// 0x8007 NavigationCurrentPosition -> distance to next maneuver.
 static void nav16_on_position(const AaPosition *p)
 {
 #if LOG_LEVEL <= LOG_LEVEL_VERBOSE
@@ -681,23 +470,22 @@ static void nav16_on_position(const AaPosition *p)
 #endif
     if (!p->have_step) return;
     uint8_t unit = aa_to_mazda_unit(p->step_units);
-    if (unit > 5) unit = 0;                             // clamp untrusted unit
+    if (unit > 5) unit = 0;
     g_nav16_acc.dist_unit = unit;
     g_nav16_acc.dist_dec  = quantize_dist_x10(parse_dist_x10(p->step_display), unit);
     nav16_emit_if_changed();
 }
 
-// 0x8003 NavigationStatus / 0x8002 cluster STOP -> lifecycle: blank or keep.
 static void nav16_on_status(const AaStatus *s)
 {
     if (s->cluster_stop) {
-        hud_tx_status(2);                               // guidance ended -> blank
+        hud_tx_status(2);
         hud_feed_nav16_reset();
         LOGD("nav: cluster STOP (0x8002) -> HUD cleared");
         return;
     }
     if (s->nav_status == NAV_INACTIVE || s->nav_status == NAV_UNAVAILABLE) {
-        hud_tx_status(2);                               // guidance ended -> blank
+        hud_tx_status(2);
         hud_feed_nav16_reset();
         LOGD("nav: NavigationStatus=%d -> HUD cleared", s->nav_status);
     } else {
@@ -708,10 +496,6 @@ static void nav16_on_status(const AaStatus *s)
 void hud_post_aap_create_session(void)
 {
     hud_tx_start();
-    // Start the GAL 1.6 receiver only when that protocol is enabled — otherwise
-    // the aap_service shim never sends and the socket would idle for nothing.
-    // rx_start registers our decode callbacks before spawning the thread, so the
-    // first frame it feeds already has a destination.
     if (libpatch_config::use_protocol_v1_6()) {
         hud_nav16_rx_start(&nav16_on_guidance, &nav16_on_position, &nav16_on_status);
     }
@@ -720,7 +504,7 @@ void hud_post_aap_create_session(void)
 void hud_pre_aap_destroy_session(void)
 {
     if (libpatch_config::use_protocol_v1_6()) {
-        hud_nav16_rx_stop();          // joins the rx thread + detaches the sink
+        hud_nav16_rx_stop();
     }
     hud_tx_stop();
 }
