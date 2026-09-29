@@ -102,9 +102,8 @@ jobs:
           set -euo pipefail
           VERSION="$(git rev-parse --short HEAD)"
           mkdir -p dist
-          # Same packaging as release.yml: one zip per config, .so
-          # keeps its canonical name in both, resources/ bundled in both.
-          # Normal (release) archive has no suffix; debug gets -debug.
+          # One zip per config, contents only — the archive has the .so
+          # files and resources/ at the top level, no wrapper folder.
           for cfg in release debug; do
             case "$cfg" in
               release) name="oem-aa-mod-${VERSION}" ;;
@@ -120,8 +119,8 @@ jobs:
               file "$so" | grep -q 'ELF 32-bit.*ARM' || {
                 echo "::error::$so is not an ARM shared object"; exit 1; }
             done
-            # Wrapper dir inside the archive avoids a zip-bomb on extract.
-            ( cd staging && zip -r "../dist/${name}.zip" "$name" )
+            # Zip the CONTENTS of the staging dir, not the dir itself.
+            ( cd "$stage" && zip -r "${GITHUB_WORKSPACE}/dist/${name}.zip" . )
           done
           ( cd dist && sha256sum ./*.zip > SHA256SUMS )
           echo "--- dist ---"
