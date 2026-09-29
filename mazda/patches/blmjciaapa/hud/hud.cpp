@@ -1,10 +1,15 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//
+// Adapted from headunit (https://github.com/Trevelopment/headunit),
+// licensed under GNU AGPL v3.
+// See NOTICE.md at the repo root for the full attribution.
+
 #define LOG_TAG "HUD"
 #include "../log.h"
 #include "hud.h"
 #include "nav16_rx.h"        // receiver lifecycle/seen + re-exported hud_nav16 API
                              // (HudNav16Sink, AaGuidance/Position/Status, AaLane, mappers)
 #include "common/config.h"   // libpatch_config::hud_transport()
-
 
 #include "svcnavi_tx.h"
 #include "vbs_tx.h"
@@ -14,9 +19,9 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 
 namespace {
-
 
 struct HudTransportOps {
     void (*start)();
@@ -24,9 +29,8 @@ struct HudTransportOps {
     void (*status)(uint32_t status);
     void (*next_turn)(const char *road, uint32_t icon);
     void (*distance)(int32_t dist_dec, uint8_t dist_unit);
-    void (*lanes)(const uint8_t *codes);             // raw setter; fed by emit_lane_codes
+    void (*lanes)(const uint8_t *codes);
 };
-
 
 void svcnavi_next_turn_adapter(const char *road, uint32_t icon)
 {
@@ -61,7 +65,6 @@ const HudTransportOps kVbsOps = {
     &vbs_next_turn_adapter, &vbs_tx_distance, &vbs_tx_lanes,
 };
 
-
 const HudTransportOps *g_tx = &kSvcnaviOps;
 
 inline void hud_tx_start()
@@ -73,39 +76,40 @@ inline void hud_tx_start()
 inline void hud_tx_stop()   { g_tx->stop(); }
 
 inline void hud_tx_status(uint32_t status) { g_tx->status(status); }
+
 inline void hud_tx_next_turn(const char *road, uint32_t side, uint32_t event,
                              int32_t angle, int32_t /*number*/)
 {
-    
     uint32_t icon = compute_turn_icon(event, side, angle);
 
-    
-    if (road != nullptr && libpatch_config::hud_fold_latin()) {
-        char buf[256];
-        strncpy(buf, road, sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
-        hud_translit::fold(buf);
-        g_tx->next_turn(buf, icon);
-        return;
+    // Build the street string with the » prefix, then hand it to the
+    // transport. Prefixed buffer is local; the transport copies it
+    // synchronously, so lifetime is fine.
+    char prefixed[256];
+    if (road != nullptr) {
+        snprintf(prefixed, sizeof(prefixed), "\xc2\xbb %s", road);
+    } else {
+        snprintf(prefixed, sizeof(prefixed), "\xc2\xbb");
     }
-    g_tx->next_turn(road, icon);
+
+    if (libpatch_config::hud_fold_latin()) {
+        hud_translit::fold(prefixed);
+    }
+    g_tx->next_turn(prefixed, icon);
 }
+
 inline void hud_tx_distance(int32_t disp_dist, uint32_t disp_unit)
 {
-    
     g_tx->distance(disp_dist / 100, map_distance_unit(disp_unit));
 }
 
+constexpr int kCbListWordSlots = 19;
+constexpr int kCbListNavSlot   = 10;
+constexpr int kCbListUserSlot  = 18;
 
-constexpr int kCbListWordSlots = 19;       // 0x4c bytes
-constexpr int kCbListNavSlot   = 10;       // byte offset 0x28 — E_AAP_EVENT_NAV_DATA_CB
-constexpr int kCbListUserSlot  = 18;       // byte offset 0x48 — passed as first arg
-
-
-// emits 0x502 from a NAVDistanceMessage).
-constexpr uint32_t kTagStatus    = 0x500;   // NAVMessagesStatus
-constexpr uint32_t kTagNextTurn  = 0x501;   // NAVTurnMessage
-constexpr uint32_t kTagDistance  = 0x502;   // NAVDistanceMessage
+constexpr uint32_t kTagStatus    = 0x500;
+constexpr uint32_t kTagNextTurn  = 0x501;
+constexpr uint32_t kTagDistance  = 0x502;
 
 enum NavStatusEnum : uint32_t {
     NAV_STATUS_START = 1,
@@ -139,13 +143,12 @@ enum NavTurnEventEnum : uint32_t {
     NAV_TURN_EVENT_DESTINATION              = 19,
 };
 
-
 uint32_t decode_turn_event(uint32_t compacted)
 {
     switch (compacted) {
-    case 15: return NAV_TURN_EVENT_FERRY_BOAT;   // 15 -> 16
-    case 16: return NAV_TURN_EVENT_FERRY_TRAIN;  // 16 -> 17
-    case 17: return NAV_TURN_EVENT_DESTINATION;  // 17 -> 19
+    case 15: return NAV_TURN_EVENT_FERRY_BOAT;
+    case 16: return NAV_TURN_EVENT_FERRY_TRAIN;
+    case 17: return NAV_TURN_EVENT_DESTINATION;
     default: return compacted;
     }
 }
@@ -179,7 +182,6 @@ struct StatusHdr {
 };
 static_assert(sizeof(StatusHdr) == 36, "StatusHdr must match 36-byte SDK buffer");
 
-// 0x502 header — distance / ETA. Last 16 bytes reserved.
 struct DistanceHdr {
     uint32_t tag;
     int32_t  distance;
@@ -247,8 +249,6 @@ const char *nav_distance_unit_name(uint32_t v)
     }
 }
 
-// Forward declaration so substitute_nav_cb() below can take its
-// address before the body is seen.
 void our_nav_cb(void *user_ctx, void *hdr36);
 
 void dump_status(const StatusHdr *h)
