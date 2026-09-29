@@ -1,34 +1,19 @@
 name: CI
 
-# Catches breakage before a release tag is cut: runs the host self-tests
-# (test/nav16_test), then builds both configs and packages the same two
-# tarballs the release workflow ships (versioned by short SHA instead of
-# a tag), so what CI produces matches a real release.
-# Tag pushes are intentionally NOT built here — release.yml owns those.
 on:
-  # Only main on push; PR branches are covered by pull_request below.
-  # (Triggering push on all branches would double-run every push to a
-  # branch that has an open PR — once for push, once for the PR.)
   push:
     branches: [main]
   pull_request:
-  # Adds a manual "Run workflow" button in the Actions tab so a build
-  # can be kicked off without making a commit.
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push to the same branch/PR supersedes an in-flight run.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # Host self-tests — pure g++ builds that run on the runner itself, so
-  # this job needs no cross toolchain and reports independently of the
-  # (slower) ARM build job. Only nav16_test qualifies: gsi_test/lane_test
-  # are on-device ARM tools (lane_test also needs a local-only dbus header).
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -49,9 +34,6 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      # The toolchain content is fixed by the submodule gitlink, so its
-      # commit SHA is the natural cache key — read it straight from the
-      # gitlink (no submodule checkout needed).
       - name: Resolve m3-toolchain submodule commit
         id: toolchain
         run: echo "sha=$(git ls-tree HEAD -- mazda/m3-toolchain | awk '{print $3}')" >> "$GITHUB_OUTPUT"
@@ -67,12 +49,6 @@ jobs:
         if: steps.toolchain-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          # Fetch the toolchain as a plain directory (not a live git
-          # submodule): clone at the pinned SHA, then drop .git. This
-          # keeps the cache as plain files so it has no dangling gitlink
-          # for actions/checkout's post-job `git submodule foreach`
-          # cleanup to trip over (the cache restores the worktree but
-          # not .git/modules/...). The build only needs the files.
           url=$(git config -f .gitmodules submodule.mazda/m3-toolchain.url)
           rm -rf mazda/m3-toolchain
           git clone --filter=blob:none "$url" mazda/m3-toolchain
@@ -97,45 +73,42 @@ jobs:
       - name: Build (release + debug)
         run: make -C mazda -j"$(nproc)" all
 
-      - name: Package release + debug archives
+      - name: Stage release files
         run: |
           set -euo pipefail
-          VERSION="$(git rev-parse --short HEAD)"
-          mkdir -p dist
-          # One zip per config, contents only — the archive has the .so
-          # files and resources/ at the top level, no wrapper folder.
-          for cfg in release debug; do
-            case "$cfg" in
-              release) name="oem-aa-mod-${VERSION}" ;;
-              debug)   name="oem-aa-mod-${VERSION}-debug" ;;
-            esac
-            stage="staging/${name}"
-            mkdir -p "$stage"
-            cp mazda/build/"$cfg"/libpatch-*.so "$stage/"
-            cp -r resources "$stage/"
-            # Catch a build that "succeeds" but links for the wrong target.
-            for so in "$stage"/libpatch-*.so; do
-              file "$so"
-              file "$so" | grep -q 'ELF 32-bit.*ARM' || {
-                echo "::error::$so is not an ARM shared object"; exit 1; }
-            done
-            # Zip the CONTENTS of the staging dir, not the dir itself.
-            ( cd "$stage" && zip -r "${GITHUB_WORKSPACE}/dist/${name}.zip" . )
-          done
-          ( cd dist && sha256sum ./*.zip > SHA256SUMS )
-          echo "--- dist ---"
-          ls -la dist
-          for archive in dist/*.zip; do
-            echo "--- $archive contents ---"
-            unzip -l "$archive"
+          rm -rf staging
+          mkdir -p staging
+          cp mazda/build/release/libpatch-*.so staging/
+          cp -r resources staging/
+          # Catch a build that "succeeds" but links for the wrong target.
+          for so in staging/libpatch-*.so; do
+            file "$so"
+            file "$so" | grep -q 'ELF 32-bit.*ARM' || {
+              echo "::error::$so is not an ARM shared object"; exit 1; }
           done
 
-      - name: Upload archives
+      - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: oem-aa-mod-archives
+          name: oem-aa-mod-release
           path: |
-            dist/*.zip
-            dist/SHA256SUMS
+            staging/**
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Stage debug files
+        run: |
+          set -euo pipefail
+          rm -rf staging-debug
+          mkdir -p staging-debug
+          cp mazda/build/debug/libpatch-*.so staging-debug/
+          cp -r resources staging-debug/
+
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oem-aa-mod-debug
+          path: |
+            staging-debug/**
           retention-days: 14
           if-no-files-found: error
