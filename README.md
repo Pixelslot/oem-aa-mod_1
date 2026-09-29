@@ -1,6 +1,5 @@
 # oem-aa-mod
 
-
 Custom `LD_PRELOAD` shims for the Mazda CMU (Connectivity Master Unit)
 infotainment system. Each shim targets one specific OEM `.so` (e.g.
 `blmjciaapa.so`) and is deployed into a single PID via `sm.conf`'s
