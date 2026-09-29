@@ -12,6 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Adds a manual "Run workflow" button in the Actions tab so a build
+  # can be kicked off without making a commit.
+  workflow_dispatch:
 
 permissions:
   contents: read
